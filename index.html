@@ -310,10 +310,23 @@ tr:hover td{background:#fafaf8}
 
 <script>
 // ── ROSTER DATA (from MissedShiftsTemplate.xlsx) ──────────────────────────
-// ── SHAREPOINT CONFIGURATION ─────────────────────────────────────────────────
-// Update SP_SITE to your SharePoint team site URL before deploying
-const SP_SITE = 'https://jadehealthcare.sharepoint.com/sites/PureHealth';
-const SP_ROSTER_URL = SP_SITE +
+// ── SHAREPOINT / ONEDRIVE CONFIGURATION ──────────────────────────────────────
+// Joyce's personal OneDrive — EmployeeRoster.xlsx
+// File ID from SharePoint URL (sourcedoc parameter)
+const ONEDRIVE_HOST   = 'https://jadehealthcare-my.sharepoint.com';
+const ONEDRIVE_USER   = 'joyce_purehlth_com';
+const EXCEL_FILE_ID   = 'F6BA43E1-D82D-4045-85C8-24DB50034722';
+const EXCEL_SHEET     = 'EmployeeRosterJT_NEW';
+
+// SharePoint REST API to read Excel table rows directly from OneDrive
+// Uses the personal OneDrive /_api/v2.1 endpoint
+const SP_SITE         = ONEDRIVE_HOST + '/personal/' + ONEDRIVE_USER;
+const SP_ROSTER_URL   = SP_SITE +
+  "/_api/v2.1/drives/me/items/" + EXCEL_FILE_ID +
+  "/workbook/tables/EmployeeRosterJT_NEW/rows?$top=2000";
+
+// Fallback: SharePoint List URL (if Power Automate list is set up)
+const SP_LIST_URL = 'https://jadehealthcare.sharepoint.com/sites/PureHealth' +
   "/_api/lists/getbytitle('EmployeeRoster')/items" +
   "?$select=id,name,facility,department,jobTitle,payrollProfileCode," +
   "payrollProfileTitle,status,employmentCategory,payType," +
@@ -351,19 +364,78 @@ async function spRequest(method, url, body, extraHeaders={}) {
 
 // Load roster from SharePoint list; falls back to RAW_ROSTER if unavailable
 async function loadRoster() {
-  // When SharePoint is configured, this fetches live data.
-  // Falls back to embedded RAW_ROSTER silently (e.g. during GitHub testing).
+  // Tries 3 sources in order:
+  // 1. Excel file directly via OneDrive REST API (live, always fresh)
+  // 2. SharePoint EmployeeRoster list (if Power Automate flow is set up)
+  // 3. Embedded RAW_ROSTER (GitHub testing / offline fallback)
+
+  // ── Attempt 1: Read Excel directly from OneDrive ─────────────────────────
   try {
-    const res = await fetch(SP_ROSTER_URL, {
-      headers: { 'Accept': 'application/json;odata=nometadata' },
-      credentials: 'include',
-      signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined
+    // Uses SharePoint's built-in Excel REST API — no extra setup needed
+    // Reads the EmployeeRosterJT_NEW table directly from the xlsx file
+    const excelUrl = SP_SITE +
+      "/_api/v2.1/drives/root/items/" + EXCEL_FILE_ID +
+      "/workbook/tables('" + EXCEL_SHEET + "')/rows?$top=2000";
+
+    const res = await fetch(excelUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      credentials: 'include'
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!res.ok) throw new Error('Excel API HTTP ' + res.status);
     const json = await res.json();
-    if (!json.value?.length) throw new Error('Empty roster response');
+    if (!json.value?.length) throw new Error('No rows returned from Excel');
+
+    // Excel REST API returns rows as arrays — map by column index
+    // Headers: Client_Code[0], Payroll_Profile_Code[1], Payroll_Profile_Desc[2],
+    // Department[3], Department_Desc[4], Job_Title_LA_Code[5], Job_Title_LA_Desc[6],
+    // Employee_Code[7], Legal_Lastname[8], Legal_Firstname[9], ...,
+    // Employee_Status[11], ..., DOL_Status[15], Pay_Type[16], ...,
+    // Primary_Phone[20], Secondary_Phone[22], Personal_Email[23], Work_Email[24],
+    // Employee_Name[25]
+    const active = json.value.filter(r => r.values[0][11] === 'Active');
+    RAW_ROSTER = active.map(r => {
+      const v = r.values[0];
+      return {
+        f:                   facilityLabel(String(v[2] || '')),
+        id:                  String(v[7] || ''),
+        name:                String(v[25] || ''),
+        dept:                String(v[3] || ''),
+        deptDesc:            String(v[4] || ''),
+        title:               String(v[6] || ''),
+        payrollProfileCode:  String(v[1] || ''),
+        payrollProfileTitle: String(v[2] || ''),
+        employmentCategory:  String(v[15] || ''),
+        payType:             String(v[16] || ''),
+        primaryPhone:        String(v[20] || ''),
+        secondaryPhone:      String(v[22] || ''),
+        personalEmail:       String(v[23] || ''),
+        workEmail:           String(v[24] || '')
+      };
+    });
+
+    // Also reload HRDs from the HRD sheet
+    await loadHRDSheet();
+
+    console.log('✓ Roster loaded live from OneDrive Excel:', RAW_ROSTER.length, 'active employees');
+    return;
+  } catch(err) {
+    console.log('OneDrive Excel API unavailable:', err.message);
+  }
+
+  // ── Attempt 2: SharePoint EmployeeRoster list (Power Automate populated) ──
+  try {
+    const res = await fetch(SP_LIST_URL, {
+      headers: { 'Accept': 'application/json;odata=nometadata' },
+      credentials: 'include'
+    });
+    if (!res.ok) throw new Error('SP List HTTP ' + res.status);
+    const json = await res.json();
+    if (!json.value?.length) throw new Error('Empty SP list');
     RAW_ROSTER = json.value.map(e => ({
-      f:                   facilityLabel(e.facility),
+      f:                   facilityLabel(e.facility || ''),
       id:                  String(e.id || ''),
       name:                e.name || '',
       dept:                e.department || '',
@@ -373,17 +445,53 @@ async function loadRoster() {
       payrollProfileTitle: e.payrollProfileTitle || '',
       employmentCategory:  e.employmentCategory || '',
       payType:             e.payType || '',
-      homePhone:           e.homePhone || '',
-      workPhone:           e.workPhone || '',
-      cellPhone:           e.cellPhone || '',
+      primaryPhone:        e.homePhone || '',
+      secondaryPhone:      e.workPhone || '',
       personalEmail:       e.personalEmail || '',
-      selfServiceEmail:    e.selfServiceEmail || ''
+      workEmail:           e.selfServiceEmail || ''
     }));
-    console.log('Roster loaded from SharePoint:', RAW_ROSTER.length, 'employees');
+    console.log('✓ Roster loaded from SharePoint list:', RAW_ROSTER.length, 'employees');
+    return;
   } catch(err) {
-    console.log('Using embedded roster (' + RAW_ROSTER.length + ' employees) — SharePoint not available:', err.message);
+    console.log('SharePoint list unavailable:', err.message);
   }
-  // Always resolves — never rejects
+
+  // ── Attempt 3: Embedded roster (GitHub Pages / offline) ──────────────────
+  console.log('✓ Using embedded roster:', RAW_ROSTER.length, 'employees (offline/test mode)');
+  // RAW_ROSTER already populated with real data — no action needed
+}
+
+async function loadHRDSheet() {
+  // Reload HRD bubbles from the HRD sheet in the same Excel file
+  try {
+    const hrdUrl = SP_SITE +
+      "/_api/v2.1/drives/root/items/" + EXCEL_FILE_ID +
+      "/workbook/tables('HRD')/rows?$top=100";
+    const res = await fetch(hrdUrl, {
+      headers: { 'Accept': 'application/json' },
+      credentials: 'include'
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (!json.value?.length) return;
+    // Same column layout as EmployeeRosterJT_NEW
+    // Payroll_Profile_Desc[2], Employee_Name[25], Job_Title_LA_Desc[6], Employee_Status[11]
+    const liveHRDs = {};
+    json.value.forEach(r => {
+      const v = r.values[0];
+      if (v[11] !== 'Active') return;
+      const fLabel = facilityLabel(String(v[2] || ''));
+      if (!liveHRDs[fLabel]) liveHRDs[fLabel] = [];
+      liveHRDs[fLabel].push(String(v[25] || ''));
+    });
+    // Merge into HRD_BY_FACILITY
+    Object.keys(liveHRDs).forEach(f => {
+      HRD_BY_FACILITY[f] = liveHRDs[f].sort();
+    });
+    console.log('✓ HRDs refreshed from HRD sheet');
+  } catch(e) {
+    console.log('HRD sheet reload skipped:', e.message);
+  }
 }
 
 // Write a missed shift entry to SharePoint MissedShifts list
@@ -498,7 +606,7 @@ function buildHrdDropdowns() {
 }
 
 // Trimmed representative roster per facility (real names/codes/depts/titles from file)
-const RAW_ROSTER = [
+let RAW_ROSTER = [
 // Arlington (35 employees)
 {f:'Arlington',id:'8715',name:'LEDESMA, SHIRLEY',dept:'DIRNRSG',deptDesc:'Direct Care Nursing',title:'Registered Nurse',payrollProfileCode:'0RU49',payrollProfileTitle:'PH OPS OF ARLINGTON LLC',employmentCategory:'Full-Time',payType:'Hourly',primaryPhone:'19733307455',secondaryPhone:'',personalEmail:'SHIRL.LEDESMA@YAHOO.COM',workEmail:''},
 {f:'Arlington',id:'8728',name:'MUCHO, SOLANGE',dept:'DIRNRSG',deptDesc:'Direct Care Nursing',title:'Registered Nurse',payrollProfileCode:'0RU49',payrollProfileTitle:'PH OPS OF ARLINGTON LLC',employmentCategory:'Full-Time',payType:'Hourly',primaryPhone:'14045661327',secondaryPhone:'',personalEmail:'NONGHOSOLANGE@YAHOO.COM',workEmail:''},
